@@ -1,30 +1,30 @@
 #include <Arduino.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
 #include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-Adafruit_MPU6050 mpu;
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 void setup() {
   Serial.begin(115200);
   Wire.begin();
 
-  if (!mpu.begin()) {
-    Serial.println("Failed to find MPU6050 chip");
-    while (1) {
-      delay(10);
-    }
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
   }
-  Serial.println("MPU6050 Found!");
+
+  Serial.println("OLED Found!");
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println("OLED Test Success!");
+  display.display();
 }
 
 void loop() {
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-
-  Serial.print("Accel X: "); Serial.print(a.acceleration.x);
-  Serial.print(" Y: "); Serial.print(a.acceleration.y);
-  Serial.print(" Z: "); Serial.println(a.acceleration.z);
-  
-  delay(500);
+  // Nothing to do here
 }
