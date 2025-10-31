@@ -15,9 +15,9 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 Adafruit_MPU6050 mpu;
 
 // HW-827 Pulse Sensor settings
-#define PULSE_SENSOR_PIN 4   // Changed to GPIO 4 as per your connection
+#define PULSE_SENSOR_PIN 4
 
-// Variables for heart rate calculation with improved algorithm
+// Variables for heart rate calculation
 const int RATE_SIZE = 10;
 int rates[RATE_SIZE];
 int rateSpot = 0;
@@ -38,8 +38,27 @@ unsigned long lastPulseTime = 0;
 float accelX, accelY, accelZ;
 float gyroX, gyroY, gyroZ;
 float totalAccel = 0;
+float totalGyro = 0;
 
-// I2C Scanner function
+// Seizure detection variables
+#define SEIZURE_WINDOW_SIZE 20      // Number of samples to analyze
+#define SEIZURE_THRESHOLD 3.0       // Minimum acceleration for seizure detection (m/s²)
+#define GYRO_THRESHOLD 2.0          // Minimum gyro for seizure detection (rad/s)
+#define SEIZURE_COUNT_THRESHOLD 12  // Number of high-motion samples needed (>12 triggers alert)
+
+float accelHistory[SEIZURE_WINDOW_SIZE];
+float gyroHistory[SEIZURE_WINDOW_SIZE];
+int historyIndex = 0;
+bool historyFilled = false;
+
+bool seizureDetected = false;
+unsigned long seizureStartTime = 0;
+unsigned long lastSeizureAlert = 0;
+int highMotionCount = 0;
+
+// Buzzer pin (optional - uncomment if you add a buzzer)
+// #define BUZZER_PIN 5
+
 void scanI2C() {
   byte error, address;
   int nDevices = 0;
@@ -67,19 +86,17 @@ void scanI2C() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("Starting...");
+  Serial.println("Starting Seizure Detection System...");
   
-  // Initialize I2C with custom pins and frequency
-  Wire.begin(21, 22, 100000); // SDA=21, SCL=22, 100kHz
+  // Initialize I2C
+  Wire.begin(21, 22, 100000);
   delay(100);
   
-  // Scan I2C bus first
   scanI2C();
   
   // Initialize OLED
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println(F("SSD1306 allocation failed"));
-    // Try alternate address
     if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
       Serial.println(F("OLED not found on 0x3C or 0x3D"));
     }
@@ -92,12 +109,12 @@ void setup() {
   display.display();
   delay(500);
   
-  // Initialize MPU6050 with address attempt
+  // Initialize MPU6050
   Serial.println("Attempting MPU6050 at 0x68...");
   if (!mpu.begin(0x68, &Wire)) {
     Serial.println("Failed at 0x68, trying 0x69...");
     if (!mpu.begin(0x69, &Wire)) {
-      Serial.println("Failed to find MPU6050 at both addresses!");
+      Serial.println("Failed to find MPU6050!");
       display.clearDisplay();
       display.setCursor(0, 0);
       display.println("MPU6050 Error!");
@@ -122,19 +139,28 @@ void setup() {
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
   
-  // Initialize pulse sensor variables
+  // Initialize pulse sensor
   pinMode(PULSE_SENSOR_PIN, INPUT);
   for (int i = 0; i < RATE_SIZE; i++) {
     rates[i] = 0;
   }
   
+  // Initialize seizure detection arrays
+  for (int i = 0; i < SEIZURE_WINDOW_SIZE; i++) {
+    accelHistory[i] = 0;
+    gyroHistory[i] = 0;
+  }
+  
+  // Uncomment if using buzzer
+  // pinMode(BUZZER_PIN, OUTPUT);
+  // digitalWrite(BUZZER_PIN, LOW);
+  
   Serial.println("Setup complete!");
-  Serial.println("Place finger on pulse sensor...");
   display.clearDisplay();
   display.setCursor(0, 0);
+  display.println("SEIZURE MONITOR");
   display.println("Ready!");
-  display.println("Place finger");
-  display.println("on sensor...");
+  display.println("Monitoring...");
   display.display();
   delay(2000);
 }
@@ -142,7 +168,7 @@ void setup() {
 void readPulseSensor() {
   signalValue = analogRead(PULSE_SENSOR_PIN);
   
-  // Adaptive threshold - automatically adjusts to signal range
+  // Adaptive threshold
   if (signalValue > signalMax) {
     signalMax = signalValue;
   }
@@ -150,61 +176,35 @@ void readPulseSensor() {
     signalMin = signalValue;
   }
   
-  // Gradually decay max and min to adapt to changing conditions
   signalMax = signalMax * 0.99 + signalValue * 0.01;
   signalMin = signalMin * 0.99 + signalValue * 0.01;
-  
-  // Set threshold as midpoint
   threshold = (signalMax + signalMin) / 2;
-  
-  // Debug: Print raw sensor value occasionally
-  static unsigned long lastDebug = 0;
-  if (millis() - lastDebug > 200) {
-    Serial.print("Signal: ");
-    Serial.print(signalValue);
-    Serial.print(" | Threshold: ");
-    Serial.print(threshold);
-    Serial.print(" | Min: ");
-    Serial.print(signalMin);
-    Serial.print(" | Max: ");
-    Serial.println(signalMax);
-    lastDebug = millis();
-  }
   
   // Detect rising edge of pulse
   if (signalValue > threshold && !pulseDetected) {
     pulseDetected = true;
     unsigned long currentTime = millis();
-    unsigned long IBI = currentTime - lastBeatTime; // Inter-Beat Interval
+    unsigned long IBI = currentTime - lastBeatTime;
     lastBeatTime = currentTime;
     
-    // Only count beats with realistic intervals (between 300ms and 2000ms)
-    // That's 30-200 BPM range
+    // Only count beats with realistic intervals (300ms to 2000ms = 30-200 BPM)
     if (IBI > 300 && IBI < 2000) {
       beatsPerMinute = 60000 / IBI;
       
-      // Store in circular buffer for averaging
       rates[rateSpot++] = beatsPerMinute;
       if (rateSpot >= RATE_SIZE) {
         rateSpot = 0;
       }
       
-      // Calculate average BPM from last 10 beats
       long total = 0;
       for (int i = 0; i < RATE_SIZE; i++) {
         total += rates[i];
       }
       beatAvg = total / RATE_SIZE;
       BPM = beatAvg;
-      
-      Serial.print("♥ Beat! BPM: ");
-      Serial.print(beatsPerMinute);
-      Serial.print(" | Avg: ");
-      Serial.println(beatAvg);
     }
   }
   
-  // Detect falling edge
   if (signalValue < threshold) {
     pulseDetected = false;
   }
@@ -227,54 +227,141 @@ void readMPU6050() {
   gyroY = g.gyro.y;
   gyroZ = g.gyro.z;
   
-  // Calculate total acceleration magnitude
+  // Calculate total acceleration magnitude (remove gravity)
   float totalAccelRaw = sqrt(accelX*accelX + accelY*accelY + accelZ*accelZ);
-  
-  // Remove gravity (9.8 m/s²) to show only movement
   totalAccel = abs(totalAccelRaw - 9.8);
+  
+  // Calculate total gyroscope magnitude
+  totalGyro = sqrt(gyroX*gyroX + gyroY*gyroY + gyroZ*gyroZ);
+}
+
+void detectSeizure() {
+  // Store current motion data in circular buffer
+  accelHistory[historyIndex] = totalAccel;
+  gyroHistory[historyIndex] = totalGyro;
+  
+  historyIndex++;
+  if (historyIndex >= SEIZURE_WINDOW_SIZE) {
+    historyIndex = 0;
+    historyFilled = true;
+  }
+  
+  // Only analyze if we have enough data
+  if (!historyFilled) {
+    return;
+  }
+  
+  // Count samples that exceed thresholds
+  highMotionCount = 0;
+  
+  for (int i = 0; i < SEIZURE_WINDOW_SIZE; i++) {
+    if (accelHistory[i] > SEIZURE_THRESHOLD || gyroHistory[i] > GYRO_THRESHOLD) {
+      highMotionCount++;
+    }
+  }
+  
+  // Detect seizure: if high motion count exceeds 12
+  if (highMotionCount > 12) {
+    if (!seizureDetected) {
+      // New seizure detected
+      seizureStartTime = millis();
+      seizureDetected = true;
+      lastSeizureAlert = millis();
+      
+      // Uncomment to activate buzzer
+      // digitalWrite(BUZZER_PIN, HIGH);
+      
+      Serial.print("⚠️ SEIZURE DETECTED! High motion count: ");
+      Serial.println(highMotionCount);
+    }
+  } else {
+    if (seizureDetected && millis() - lastSeizureAlert > 1000) {
+      // Seizure pattern ended
+      seizureDetected = false;
+      seizureStartTime = 0;
+      
+      // Uncomment to deactivate buzzer
+      // digitalWrite(BUZZER_PIN, LOW);
+      
+      Serial.println("Motion normalized - Seizure alert cleared");
+    }
+  }
 }
 
 void updateDisplay() {
   display.clearDisplay();
   
-  // Display Heart Rate
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println("SEIZURE MONITOR");
-  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
-  
-  // Heart Rate
-  display.setTextSize(1);
-  display.setCursor(0, 15);
-  display.print("Heart Rate:");
-  display.setTextSize(2);
-  display.setCursor(0, 25);
-  
-  // Check if signal quality is good (range between min and max should be reasonable)
-  long signalRange = signalMax - signalMin;
-  
-  if (BPM > 30 && BPM < 200 && signalRange > 100) {
-    display.print(BPM);
-    display.print(" BPM");
-  } else if (signalRange < 100) {
+  // Check if seizure is detected (high motion > 12)
+  if (seizureDetected) {
+    // SEIZURE ALERT SCREEN
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    display.println("SEIZURE");
+    display.println("DETECTED!");
+    
     display.setTextSize(1);
-    display.setCursor(0, 25);
-    display.println("No finger");
-    display.println("detected!");
+    display.setCursor(0, 35);
+    display.print("High Motion: ");
+    display.print(highMotionCount);
+    display.print("/20");
+    
+    display.setCursor(0, 45);
+    display.print("BPM: ");
+    display.println(BPM > 30 && BPM < 200 ? String(BPM) : "--");
+    
+    display.setCursor(0, 55);
+    display.print("Motion: ");
+    display.print(totalAccel, 1);
+    display.print(" m/s2");
+    
+    // Flash display for alert
+    if ((millis() / 500) % 2 == 0) {
+      display.invertDisplay(true);
+    } else {
+      display.invertDisplay(false);
+    }
   } else {
-    display.print("-- BPM");
+    // NORMAL MONITORING SCREEN
+    display.invertDisplay(false);
+    
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("SEIZURE MONITOR");
+    display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+    
+    // Heart Rate
+    display.setCursor(0, 15);
+    display.print("Heart Rate:");
+    display.setTextSize(2);
+    display.setCursor(0, 25);
+    
+    long signalRange = signalMax - signalMin;
+    
+    if (BPM > 30 && BPM < 200 && signalRange > 100) {
+      display.print(BPM);
+      display.print(" BPM");
+    } else if (signalRange < 100) {
+      display.setTextSize(1);
+      display.setCursor(0, 25);
+      display.println("No finger");
+      display.println("detected!");
+    } else {
+      display.print("-- BPM");
+    }
+    
+    // Motion Data
+    display.setTextSize(1);
+    display.setCursor(0, 45);
+    display.print("Motion: ");
+    display.print(totalAccel, 2);
+    display.print(" m/s2");
+    
+    display.setCursor(0, 55);
+    display.print("High: ");
+    display.print(highMotionCount);
+    display.print("/20 Gyro:");
+    display.print(totalGyro, 1);
   }
-  
-  // Motion Data
-  display.setTextSize(1);
-  display.setCursor(0, 45);
-  display.print("Motion: ");
-  display.print(totalAccel, 2);
-  display.print(" m/s2");
-  
-  display.setCursor(0, 55);
-  display.print("Rotation: ");
-  display.print(abs(gyroX) + abs(gyroY) + abs(gyroZ), 1);
   
   display.display();
 }
@@ -284,20 +371,29 @@ void loop() {
   readPulseSensor();
   readMPU6050();
   
-  // Update display every 500ms
+  // Detect seizure patterns
+  detectSeizure();
+  
+  // Update display every 250ms
   static unsigned long lastDisplayUpdate = 0;
-  if (millis() - lastDisplayUpdate > 500) {
+  if (millis() - lastDisplayUpdate > 250) {
     updateDisplay();
     lastDisplayUpdate = millis();
     
     // Serial output for debugging
-    Serial.print("BPM: ");
-    Serial.print(BPM);
-    Serial.print(" | Accel: ");
-    Serial.print(totalAccel);
-    Serial.print(" | Gyro: ");
-    Serial.println(abs(gyroX) + abs(gyroY) + abs(gyroZ));
+    if (!seizureDetected) {
+      Serial.print("BPM: ");
+      Serial.print(BPM);
+      Serial.print(" | Accel: ");
+      Serial.print(totalAccel, 2);
+      Serial.print(" | Gyro: ");
+      Serial.print(totalGyro, 2);
+      Serial.print(" | High Motion: ");
+      Serial.print(highMotionCount);
+      Serial.print("/");
+      Serial.println(SEIZURE_WINDOW_SIZE);
+    }
   }
   
-  delay(20); // Small delay for stability
+  delay(20); // 50Hz sampling rate
 }
