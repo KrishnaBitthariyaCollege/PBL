@@ -44,7 +44,12 @@ float totalGyro = 0;
 #define SEIZURE_WINDOW_SIZE 20      // Number of samples to analyze
 #define SEIZURE_THRESHOLD 3.0       // Minimum acceleration for seizure detection (m/s²)
 #define GYRO_THRESHOLD 2.0          // Minimum gyro for seizure detection (rad/s)
-#define SEIZURE_COUNT_THRESHOLD 12  // Number of high-motion samples needed (>12 triggers alert)
+#define SEIZURE_COUNT_THRESHOLD 12  // Number of high-motion samples needed
+
+// BPM thresholds for seizure validation
+#define BPM_HIGH_THRESHOLD 120      // High BPM indicating possible seizure
+#define BPM_LOW_THRESHOLD 50        // Low BPM indicating possible seizure
+#define BPM_VALIDATION_TIME 2000    // Wait 2 seconds to validate BPM reading
 
 float accelHistory[SEIZURE_WINDOW_SIZE];
 float gyroHistory[SEIZURE_WINDOW_SIZE];
@@ -52,9 +57,13 @@ int historyIndex = 0;
 bool historyFilled = false;
 
 bool seizureDetected = false;
+bool potentialSeizureMotion = false;
 unsigned long seizureStartTime = 0;
+unsigned long potentialSeizureStartTime = 0;
 unsigned long lastSeizureAlert = 0;
 int highMotionCount = 0;
+bool bpmAbnormal = false;
+bool fingerDetected = false;
 
 // Buzzer pin (optional - uncomment if you add a buzzer)
 // #define BUZZER_PIN 5
@@ -180,6 +189,10 @@ void readPulseSensor() {
   signalMin = signalMin * 0.99 + signalValue * 0.01;
   threshold = (signalMax + signalMin) / 2;
   
+  // Check if finger is detected based on signal range
+  long signalRange = signalMax - signalMin;
+  fingerDetected = (signalRange > 100);
+  
   // Detect rising edge of pulse
   if (signalValue > threshold && !pulseDetected) {
     pulseDetected = true;
@@ -260,10 +273,17 @@ void detectSeizure() {
     }
   }
   
-  // Detect seizure: if high motion count exceeds 12
-  if (highMotionCount > 12) {
+  // Check if BPM is abnormal (high or low) AND finger is detected
+  bpmAbnormal = fingerDetected && BPM > 30 && 
+                ((BPM > BPM_HIGH_THRESHOLD) || (BPM < BPM_LOW_THRESHOLD));
+  
+  // Detect potential seizure motion (high motion count > 12)
+  bool highMotionDetected = (highMotionCount > SEIZURE_COUNT_THRESHOLD);
+  
+  // SEIZURE LOGIC: High motion + Abnormal BPM = Seizure
+  if (highMotionDetected && bpmAbnormal) {
     if (!seizureDetected) {
-      // New seizure detected
+      // New seizure detected - both conditions met
       seizureStartTime = millis();
       seizureDetected = true;
       lastSeizureAlert = millis();
@@ -271,19 +291,47 @@ void detectSeizure() {
       // Uncomment to activate buzzer
       // digitalWrite(BUZZER_PIN, HIGH);
       
-      Serial.print("⚠️ SEIZURE DETECTED! High motion count: ");
-      Serial.println(highMotionCount);
+      Serial.println("⚠️⚠️⚠️ SEIZURE DETECTED! ⚠️⚠️⚠️");
+      Serial.print("High motion count: ");
+      Serial.print(highMotionCount);
+      Serial.print(" | BPM: ");
+      Serial.print(BPM);
+      Serial.println(BPM > BPM_HIGH_THRESHOLD ? " (HIGH)" : " (LOW)");
     }
-  } else {
-    if (seizureDetected && millis() - lastSeizureAlert > 1000) {
-      // Seizure pattern ended
+  } 
+  else if (highMotionDetected && !bpmAbnormal) {
+    // High motion but normal/no BPM - potential seizure, waiting for validation
+    if (!potentialSeizureMotion) {
+      potentialSeizureMotion = true;
+      potentialSeizureStartTime = millis();
+      Serial.println("⚠️ High motion detected - Waiting for BPM confirmation...");
+      Serial.print("High motion: ");
+      Serial.print(highMotionCount);
+      Serial.print(" | BPM: ");
+      Serial.print(BPM);
+      Serial.print(" | Finger: ");
+      Serial.println(fingerDetected ? "YES" : "NO");
+    }
+    
+    // Clear seizure if it was previously detected but BPM normalized
+    if (seizureDetected) {
       seizureDetected = false;
       seizureStartTime = 0;
-      
-      // Uncomment to deactivate buzzer
       // digitalWrite(BUZZER_PIN, LOW);
-      
-      Serial.println("Motion normalized - Seizure alert cleared");
+      Serial.println("Seizure cleared - BPM normalized");
+    }
+  }
+  else {
+    // No high motion or seizure ended
+    if (seizureDetected) {
+      seizureDetected = false;
+      seizureStartTime = 0;
+      // digitalWrite(BUZZER_PIN, LOW);
+      Serial.println("Seizure ended - Motion normalized");
+    }
+    if (potentialSeizureMotion) {
+      potentialSeizureMotion = false;
+      Serial.println("Potential seizure cleared - Motion normalized");
     }
   }
 }
@@ -291,26 +339,27 @@ void detectSeizure() {
 void updateDisplay() {
   display.clearDisplay();
   
-  // Check if seizure is detected (high motion > 12)
+  // Check if seizure is detected (high motion + abnormal BPM)
   if (seizureDetected) {
     // SEIZURE ALERT SCREEN
     display.setTextSize(2);
     display.setCursor(0, 0);
     display.println("SEIZURE");
-    display.println("DETECTED!");
+    display.println("ALERT!");
     
     display.setTextSize(1);
     display.setCursor(0, 35);
-    display.print("High Motion: ");
-    display.print(highMotionCount);
-    display.print("/20");
+    display.print("BPM: ");
+    display.print(BPM);
+    display.println(BPM > BPM_HIGH_THRESHOLD ? " HIGH" : " LOW");
     
     display.setCursor(0, 45);
-    display.print("BPM: ");
-    display.println(BPM > 30 && BPM < 200 ? String(BPM) : "--");
+    display.print("Motion: ");
+    display.print(highMotionCount);
+    display.print("/20 HIGH");
     
     display.setCursor(0, 55);
-    display.print("Motion: ");
+    display.print("Accel: ");
     display.print(totalAccel, 1);
     display.print(" m/s2");
     
@@ -320,7 +369,39 @@ void updateDisplay() {
     } else {
       display.invertDisplay(false);
     }
-  } else {
+  } 
+  else if (potentialSeizureMotion) {
+    // POTENTIAL SEIZURE - WAITING FOR BPM CONFIRMATION
+    display.invertDisplay(false);
+    
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("HIGH MOTION");
+    display.println("Checking BPM...");
+    display.drawLine(0, 18, 128, 18, SSD1306_WHITE);
+    
+    display.setCursor(0, 22);
+    display.print("Motion: ");
+    display.print(highMotionCount);
+    display.print("/20");
+    
+    display.setCursor(0, 32);
+    display.print("BPM: ");
+    if (fingerDetected && BPM > 30) {
+      display.print(BPM);
+      display.print(" (Normal)");
+    } else if (!fingerDetected) {
+      display.print("No finger");
+    } else {
+      display.print("Reading...");
+    }
+    
+    display.setCursor(0, 45);
+    display.println("Place finger on");
+    display.setCursor(0, 55);
+    display.println("sensor for check");
+  }
+  else {
     // NORMAL MONITORING SCREEN
     display.invertDisplay(false);
     
@@ -335,16 +416,14 @@ void updateDisplay() {
     display.setTextSize(2);
     display.setCursor(0, 25);
     
-    long signalRange = signalMax - signalMin;
-    
-    if (BPM > 30 && BPM < 200 && signalRange > 100) {
+    if (BPM > 30 && BPM < 200 && fingerDetected) {
       display.print(BPM);
       display.print(" BPM");
-    } else if (signalRange < 100) {
+    } else if (!fingerDetected) {
       display.setTextSize(1);
       display.setCursor(0, 25);
       display.println("No finger");
-      display.println("detected!");
+      display.println("detected");
     } else {
       display.print("-- BPM");
     }
@@ -359,7 +438,7 @@ void updateDisplay() {
     display.setCursor(0, 55);
     display.print("High: ");
     display.print(highMotionCount);
-    display.print("/20 Gyro:");
+    display.print("/20 G:");
     display.print(totalGyro, 1);
   }
   
@@ -384,6 +463,8 @@ void loop() {
     if (!seizureDetected) {
       Serial.print("BPM: ");
       Serial.print(BPM);
+      Serial.print(" | Finger: ");
+      Serial.print(fingerDetected ? "YES" : "NO");
       Serial.print(" | Accel: ");
       Serial.print(totalAccel, 2);
       Serial.print(" | Gyro: ");
@@ -391,7 +472,13 @@ void loop() {
       Serial.print(" | High Motion: ");
       Serial.print(highMotionCount);
       Serial.print("/");
-      Serial.println(SEIZURE_WINDOW_SIZE);
+      Serial.print(SEIZURE_WINDOW_SIZE);
+      Serial.print(" | Status: ");
+      if (potentialSeizureMotion) {
+        Serial.println("MONITORING");
+      } else {
+        Serial.println("NORMAL");
+      }
     }
   }
   
