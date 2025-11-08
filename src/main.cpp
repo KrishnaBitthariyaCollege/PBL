@@ -5,7 +5,34 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// OLED Display settings
+// ------------------------------------------------
+// 🌐 TELEGRAM & WI-FI LIBRARIES AND CREDENTIALS
+// ------------------------------------------------
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// ⚠️ YOUR ACTUAL CREDENTIALS ⚠️
+const char* ssid = "2601";          // 🔹 Wi-Fi SSID
+const char* password = "02072005";  // 🔹 Wi-Fi Password
+
+String botToken = "8107715878:AAHgsN_z0oeTarAGJ2o3HKU7P4IYazNNdkY";  // 🔹 Telegram Bot Token
+String chatID   = "5665648239";                                       // 🔹 Telegram Chat ID
+
+// Hardcoded TCET Location (19.206204, 72.875020)
+const float TCET_LATITUDE = 19.206204; 
+const float TCET_LONGITUDE = 72.875020;
+
+// NEW: Flag to control Telegram alert sending
+bool telegramAlertSent = false;
+unsigned long lastTelegramAlert = 0;
+#define TELEGRAM_ALERT_COOLDOWN 60000  // 60 seconds cooldown between alerts
+
+
+// ------------------------------------------------
+// 💻 OLED Display settings
+// ------------------------------------------------
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
@@ -14,8 +41,9 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 // MPU6050 sensor
 Adafruit_MPU6050 mpu;
 
-// HW-827 Pulse Sensor settings
-#define PULSE_SENSOR_PIN 4
+// ⚠️ CRITICAL FIX: Changed from GPIO4 (ADC2) to GPIO34 (ADC1)
+// GPIO4 conflicts with Wi-Fi! ADC1 pins work with Wi-Fi.
+#define PULSE_SENSOR_PIN 34  // Changed from 4 to 34 (ADC1_6)
 
 // Variables for heart rate calculation
 const int RATE_SIZE = 10;
@@ -41,15 +69,15 @@ float totalAccel = 0;
 float totalGyro = 0;
 
 // Seizure detection variables
-#define SEIZURE_WINDOW_SIZE 20      // Number of samples to analyze
-#define SEIZURE_THRESHOLD 3.0       // Minimum acceleration for seizure detection (m/s²)
-#define GYRO_THRESHOLD 2.0          // Minimum gyro for seizure detection (rad/s)
-#define SEIZURE_COUNT_THRESHOLD 12  // Number of high-motion samples needed
+#define SEIZURE_WINDOW_SIZE 20      
+#define SEIZURE_THRESHOLD 3.0       
+#define GYRO_THRESHOLD 2.0          
+#define SEIZURE_COUNT_THRESHOLD 12  
 
 // BPM thresholds for seizure validation
-#define BPM_HIGH_THRESHOLD 120      // High BPM indicating possible seizure
-#define BPM_LOW_THRESHOLD 50        // Low BPM indicating possible seizure
-#define BPM_VALIDATION_TIME 2000    // Wait 2 seconds to validate BPM reading
+#define BPM_HIGH_THRESHOLD 120      
+#define BPM_LOW_THRESHOLD 50        
+#define BPM_VALIDATION_TIME 2000    
 
 float accelHistory[SEIZURE_WINDOW_SIZE];
 float gyroHistory[SEIZURE_WINDOW_SIZE];
@@ -68,6 +96,141 @@ bool fingerDetected = false;
 // Buzzer pin (optional - uncomment if you add a buzzer)
 // #define BUZZER_PIN 5
 
+
+// ------------------------------------------------
+// ⚙️ FUNCTION PROTOTYPES
+// ------------------------------------------------
+void sendTelegramMessage(String message);
+void sendLocationToTelegram();
+void sendActualLocationToTelegram(float lat, float lon);
+void setupWiFi(); 
+
+
+// ------------------------------------------------
+// 🌐 WI-FI AND TELEGRAM ALERT FUNCTIONS
+// ------------------------------------------------
+
+void setupWiFi() {
+  Serial.println("\n🌐 Starting Wi-Fi + Telegram Alert System");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(500);
+
+  Serial.println("Connecting to Wi-Fi...");
+  WiFi.begin(ssid, password);
+
+  int counter = 0;
+  while (WiFi.status() != WL_CONNECTED && counter < 25) {
+    delay(1000);
+    Serial.print(".");
+    counter++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ Wi-Fi Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    delay(1000);
+    sendTelegramMessage("✅ Seizure Monitoring System Connected to Wi-Fi!");
+  } else {
+    Serial.println("\n❌ Failed to connect to Wi-Fi. Telegram alerts disabled.");
+  }
+}
+
+// ===== Send Text Message to Telegram =====
+void sendTelegramMessage(String message) {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure client;
+    client.setInsecure(); // Skip SSL verification
+
+    HTTPClient http;
+    // Basic URL-encoding
+    String encodedMessage = "";
+    for (int i = 0; i < message.length(); i++) {
+        char c = message.charAt(i);
+        if (isAlphaNumeric(c) || c == ' ' || c == '.' || c == ',' || c == '-' || c == '_' || c == '/' || c == '!' || c == ':') {
+            if (c == ' ') encodedMessage += "+";
+            else encodedMessage += c;
+        } else {
+            char buff[4];
+            sprintf(buff, "%%%02X", c);
+            encodedMessage += buff;
+        }
+    }
+    
+    String url = "https://api.telegram.org/bot" + botToken +
+                 "/sendMessage?chat_id=" + chatID +
+                 "&text=" + encodedMessage;
+
+    http.begin(client, url);
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode > 0) {
+      Serial.println("✅ Telegram message sent!");
+    } else {
+      Serial.print("❌ Error sending message: ");
+      Serial.println(httpResponseCode);
+    }
+
+    http.end();
+  } else {
+    Serial.println("⚠️ Wi-Fi not connected!");
+  }
+}
+
+// ===== Send Location using the dedicated API (Hardcoded) =====
+void sendActualLocationToTelegram(float lat, float lon) {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure client;
+    client.setInsecure(); // Skip SSL verification
+
+    HTTPClient http;
+    // Using the official sendLocation endpoint
+    String url = "https://api.telegram.org/bot" + botToken +
+                 "/sendLocation?chat_id=" + chatID +
+                 "&latitude=" + String(lat, 6) +  
+                 "&longitude=" + String(lon, 6);
+
+    http.begin(client, url);
+    Serial.println("Attempting to send location via API...");
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode > 0) {
+      Serial.println("✅ Telegram location sent successfully!");
+    } else {
+      Serial.print("❌ Error sending location: ");
+      Serial.println(httpResponseCode);
+    }
+
+    http.end();
+  } else {
+    Serial.println("⚠️ Wi-Fi not connected!");
+  }
+}
+
+
+// ===== Send Location and Seizure Message (Uses hardcoded TCET) =====
+void sendLocationToTelegram() {
+  
+  // 1. Send the actual interactive location map (TCET Coordinates)
+  sendActualLocationToTelegram(TCET_LATITUDE, TCET_LONGITUDE); 
+  delay(500); // Small delay between requests
+
+  // 2. Send the seizure alert text message
+  String locationText = "🚨🚨 SEIZURE ALERT DETECTED! 🚨🚨\n"
+                        "Motion & Abnormal BPM confirmed.\n"
+                        "Patient location is approximately:\n"
+                        "📍 Thakur College of Engineering\n"
+                        "Time: " + String(millis()/1000) + "s since startup";
+  sendTelegramMessage(locationText);
+}
+
+
+// ------------------------------------------------
+// ⚙️ I2C Scanner
+// ------------------------------------------------
 void scanI2C() {
   byte error, address;
   int nDevices = 0;
@@ -92,6 +255,9 @@ void scanI2C() {
     Serial.println("Scan complete");
 }
 
+// ------------------------------------------------
+// ⚙️ SETUP FUNCTION
+// ------------------------------------------------
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -100,6 +266,8 @@ void setup() {
   // Initialize I2C
   Wire.begin(21, 22, 100000);
   delay(100);
+  
+  setupWiFi(); // Initialize Wi-Fi and send connection message
   
   scanI2C();
   
@@ -165,15 +333,21 @@ void setup() {
   // digitalWrite(BUZZER_PIN, LOW);
   
   Serial.println("Setup complete!");
+  Serial.println("⚠️ IMPORTANT: Connect pulse sensor to GPIO 34 (not GPIO 4)");
   display.clearDisplay();
   display.setCursor(0, 0);
   display.println("SEIZURE MONITOR");
   display.println("Ready!");
   display.println("Monitoring...");
+  display.println("");
+  display.println("Pulse: GPIO34");
   display.display();
   delay(2000);
 }
 
+// ------------------------------------------------
+// ❤️ READ PULSE SENSOR
+// ------------------------------------------------
 void readPulseSensor() {
   signalValue = analogRead(PULSE_SENSOR_PIN);
   
@@ -228,6 +402,9 @@ void readPulseSensor() {
   }
 }
 
+// ------------------------------------------------
+// 📊 READ MPU6050
+// ------------------------------------------------
 void readMPU6050() {
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
@@ -248,6 +425,9 @@ void readMPU6050() {
   totalGyro = sqrt(gyroX*gyroX + gyroY*gyroY + gyroZ*gyroZ);
 }
 
+// ------------------------------------------------
+// 🧠 DETECT SEIZURE WITH TELEGRAM INTEGRATION
+// ------------------------------------------------
 void detectSeizure() {
   // Store current motion data in circular buffer
   accelHistory[historyIndex] = totalAccel;
@@ -288,6 +468,19 @@ void detectSeizure() {
       seizureDetected = true;
       lastSeizureAlert = millis();
       
+      // 🚨 TELEGRAM ALERT INTEGRATION 🚨
+      // Check if enough time has passed since last alert (cooldown)
+      if (WiFi.status() == WL_CONNECTED && 
+          !telegramAlertSent && 
+          (millis() - lastTelegramAlert > TELEGRAM_ALERT_COOLDOWN)) {
+          
+          Serial.println("🚨 Sending Telegram alert...");
+          sendLocationToTelegram(); // Sends both location and text message
+          telegramAlertSent = true;
+          lastTelegramAlert = millis();
+      }
+      // ----------------------------------------------
+      
       // Uncomment to activate buzzer
       // digitalWrite(BUZZER_PIN, HIGH);
       
@@ -317,6 +510,7 @@ void detectSeizure() {
     if (seizureDetected) {
       seizureDetected = false;
       seizureStartTime = 0;
+      telegramAlertSent = false; // Reset flag when seizure ends
       // digitalWrite(BUZZER_PIN, LOW);
       Serial.println("Seizure cleared - BPM normalized");
     }
@@ -326,6 +520,7 @@ void detectSeizure() {
     if (seizureDetected) {
       seizureDetected = false;
       seizureStartTime = 0;
+      telegramAlertSent = false; // Reset flag when seizure ends
       // digitalWrite(BUZZER_PIN, LOW);
       Serial.println("Seizure ended - Motion normalized");
     }
@@ -336,6 +531,9 @@ void detectSeizure() {
   }
 }
 
+// ------------------------------------------------
+// 🖥️ UPDATE DISPLAY
+// ------------------------------------------------
 void updateDisplay() {
   display.clearDisplay();
   
@@ -354,9 +552,7 @@ void updateDisplay() {
     display.println(BPM > BPM_HIGH_THRESHOLD ? " HIGH" : " LOW");
     
     display.setCursor(0, 45);
-    display.print("Motion: ");
-    display.print(highMotionCount);
-    display.print("/20 HIGH");
+    display.print(telegramAlertSent ? "Alert Sent!" : "Sending..."); 
     
     display.setCursor(0, 55);
     display.print("Accel: ");
@@ -445,6 +641,9 @@ void updateDisplay() {
   display.display();
 }
 
+// ------------------------------------------------
+// 🔄 MAIN LOOP
+// ------------------------------------------------
 void loop() {
   // Read sensors
   readPulseSensor();
